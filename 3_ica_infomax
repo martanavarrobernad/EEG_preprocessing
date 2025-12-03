@@ -1,0 +1,48 @@
+# 3_eeg_ica_infomax.py
+"""
+Paso EEG-3: ICA Infomax
+Entrada:
+   eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
+Salida:
+   eeg_step3_ica/sub-XXX/eeg_ica.fif  + eeg_ica_components.fif
+"""
+
+from pathlib import Path
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR = BASE / "eeg_step2_clean_concat_05_45"
+OUT_DIR = BASE / "eeg_step3_ica"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+def step3_ica(subjects=range(1, 10)):
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        fif_path = IN_DIR / subj / "eeg_allblocks_05_45.fif"
+        if not fif_path.exists():
+            continue
+
+        print(f"\n===== {subj} =====")
+        raw = mne.io.read_raw_fif(fif_path, preload=True)
+
+        ica = mne.preprocessing.ICA(
+            method="infomax", max_iter="auto", random_state=97
+        )
+        print("  → Fitting ICA...")
+        ica.fit(raw)
+
+        out_sub = OUT_DIR / subj
+        out_sub.mkdir(exist_ok=True)
+
+        ica_path = out_sub / "eeg_ica.fif"
+        ica.save(ica_path)
+        print("  ✔ Saved ICA:", ica_path)
+
+        comp_raw = ica.get_sources(raw)
+        comp_path = out_sub / "eeg_ica_components.fif"
+        comp_raw.save(comp_path, overwrite=True)
+        print("  ✔ Saved ICA components:", comp_path)
+
+
+if __name__ == "__main__":
+    step3_ica()
