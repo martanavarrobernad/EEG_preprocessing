@@ -1,0 +1,98 @@
+
+"""
+Paso EEG-4:
+  - Para cada condición (hand/foot/median/tibial):
+       1) concatenar solo esa condición
+       2) aplicar filtro notch 48–53
+       3) aplicar BPF 30–400 (BW 4th)
+       4) aplicar ICA eliminando ICs malos manual/automático
+Salida:
+   eeg_step4_sep_cleaned/sub-XXX/<cond>_sep_clean.fif
+"""
+
+from pathlib import Path
+import re
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+EEG_SRC = BASE / "eeg_1000Hz_noStimart"
+ICA_DIR = BASE / "eeg_step3_ica"
+OUT_DIR = BASE / "eeg_step4_sep_cleaned"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+CONDITIONS = ["median", "tibial"]
+
+# BAD ICs manual (si quieres un CSV):
+BAD_IC_CSV = BASE / "bad_ica_components.csv"
+
+def load_bad_ics():
+    if not BAD_IC_CSV.exists():
+        return {}
+    import pandas as pd
+    df = pd.read_csv(BAD_IC_CSV)
+    d = {}
+    for _, r in df.iterrows():
+        subj = r["subject"]
+        ics = [int(i) for i in r["bad_ics"].split(";")] if isinstance(r["bad_ics"], str) else []
+        d[subj] = ics
+    return d
+
+
+def step4_apply_ica(subjects=range(1, 10)):
+    bad_ics = load_bad_ics()
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        ica_path = ICA_DIR / subj / "eeg_ica.fif"
+        if not ica_path.exists():
+            continue
+
+        print(f"\n===== {subj} =====")
+        ica = mne.preprocessing.read_ica(ica_path)
+
+        for cond in CONDITIONS:
+            cond_dir = EEG_SRC / subj
+            fif_files = sorted(cond_dir.glob(f"*task-{cond}*_run-*.fif"))
+            if not fif_files:
+                continue
+
+            raws = []
+            for fif in fif_files:
+                print(f"  Loading {fif.name}")
+                raw = mne.io.read_raw_fif(fif, preload=True)
+                raws.append(raw)
+
+            raw = mne.concatenate_raws(raws)
+
+            print("  → Applying notch 48–53 Hz")
+            raw.notch_filter(
+                freqs=[50],
+                notch_widths=5,
+                method="iir",
+                verbose="error",
+            )
+
+            print("  → Band-pass 30–400 Hz Butterworth 4th")
+            raw.filter(
+                l_freq=30,
+                h_freq=400,
+                method="iir",
+                iir_params=dict(order=4, ftype="butter"),
+                phase="zero",
+                verbose="error",
+            )
+
+            # Aplicar ICAS con componentes malos
+            bad_list = bad_ics.get(subj, [])
+            print("  → Excluding ICs:", bad_list)
+            ica.apply(raw, exclude=bad_list)
+
+            out_subdir = OUT_DIR / subj
+            out_subdir.mkdir(exist_ok=True)
+            out_path = out_subdir / f"{cond}_sep_clean.fif"
+            raw.save(out_path, overwrite=True)
+            print("  ✔ Saved:", out_path)
+
+
+if __name__ == "__main__":
+    step4_apply_ica()
