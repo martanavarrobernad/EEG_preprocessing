@@ -1,0 +1,112 @@
+
+"""
+Paso EEG-2:
+  - Identificación de canales ruidosos (PSD + RMS)
+  - Interpolación
+  - Concatenación de todos los bloques (median + tibial)
+  - Filtro 0.5–45 Hz Butterworth 4th order (zero-phase)
+
+Entrada:
+  eeg_step1_antialias/sub-XXX/...
+Salida:
+  eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
+  + CSV de canales malos si quieres registrarlo.
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+import pandas as pd
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "eeg_step1_antialias"
+OUT_DIR = BASE / "eeg_step2_clean_concat_05_45"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+BAD_CSV = BASE / "bad_eeg_channels_manual.csv"
+
+def detect_bad_by_rms(raw, thresh_factor=5):
+    """RMS por canal, marcar canales > thresh_factor × median RMS."""
+    data = raw.get_data()
+    rms = np.sqrt(np.mean(data**2, axis=1))
+    med = np.median(rms)
+    bad = np.where(rms > thresh_factor * med)[0]
+    return [raw.ch_names[i] for i in bad]
+
+
+def load_bad_manual():
+    if not BAD_CSV.exists():
+        return {}
+    df = pd.read_csv(BAD_CSV)
+    d = {}
+    for _, r in df.iterrows():
+        if isinstance(r["bad_channels"], str) and r["bad_channels"]:
+            d[r["subject"]] = r["bad_channels"].split(";")
+        else:
+            d[r["subject"]] = []
+    return d
+
+
+def step2_clean_and_concat(subjects=range(1, 10)):
+    bad_manual = load_bad_manual()
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        subj_dir = IN_DIR / subj
+        if not subj_dir.exists():
+            continue
+
+        fif_files = sorted(subj_dir.glob("*_aa.fif"))
+        if not fif_files:
+            continue
+
+        print(f"\n===== {subj} =====")
+
+        raws = []
+        auto_bad = []
+
+        for fif in fif_files:
+            print(f"  Loading {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True)
+
+            # Plot PSD manual para inspección (comentado si no quieres pausa):
+            # raw.plot_psd()
+
+            # AUTO RMS:
+            bad_rms = detect_bad_by_rms(raw)
+            auto_bad.extend(bad_rms)
+
+            raws.append(raw)
+
+        # Unir todos bloques EEG
+        raw = mne.concatenate_raws(raws)
+
+        # Unificar lista canales malos
+        bad_list = list(set(auto_bad + bad_manual.get(subj, [])))
+        bad_list = [b for b in bad_list if b in raw.ch_names]
+
+        if bad_list:
+            print("  → Marking bad channels:", bad_list)
+            raw.info["bads"] = bad_list
+            raw.interpolate_bads()
+
+        # Filtro 0.5–45 Hz
+        print("  → Filtering 0.5–45 Butterworth 4th (zero-phase)")
+        raw.filter(
+            l_freq=0.5,
+            h_freq=45,
+            method="iir",
+            iir_params=dict(order=4, ftype="butter"),
+            phase="zero",
+            verbose="error",
+        )
+
+        out_sub = OUT_DIR / subj
+        out_sub.mkdir(exist_ok=True)
+        out_path = out_sub / "eeg_allblocks_05_45.fif"
+        raw.save(out_path, overwrite=True)
+        print("  ✔ Saved:", out_path)
+
+
+if __name__ == "__main__":
+    step2_clean_and_concat()
