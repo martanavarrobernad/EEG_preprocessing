@@ -1,0 +1,83 @@
+
+"""
+Paso EEG-5:
+  - Re-referenciar a promedio
+  - Detectar outliers:
+        banda 1–15 Hz   → >5 SD
+        banda 15–45 Hz  → >60 µV
+  - Si canal >50% muestras malas → eliminar e interpolar
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "eeg_step4_sep_cleaned"
+OUT_DIR = BASE / "eeg_step5_reref_thresholds"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+CONDITIONS = ["median", "tibial"]
+
+def band_extract(raw, l, h):
+    return raw.copy().filter(l, h, method="iir",
+                             iir_params=dict(order=4, ftype="butter"),
+                             phase="zero",
+                             verbose="error").get_data()
+
+
+def step5_reref(subjects=range(1, 10)):
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+
+        for cond in CONDITIONS:
+            fif_path = IN_DIR / subj / f"{cond}_sep_clean.fif"
+            if not fif_path.exists():
+                continue
+
+            print(f"\n===== {subj}, {cond} =====")
+            raw = mne.io.read_raw_fif(fif_path, preload=True)
+
+            # Re-reference to average
+            print("  → Setting average reference...")
+            raw.set_eeg_reference("average", verbose="error")
+
+            data = raw.get_data()
+            n_ch, n_t = data.shape
+            sf = raw.info["sfreq"]
+
+            # BANDE 1–15 Hz → SD threshold
+            print("  → Checking 1–15 Hz SD >5")
+            low = band_extract(raw, 1, 15)
+            sd_ch = low.std(axis=1)
+            sd_global = np.median(sd_ch)
+            bad_1_15 = np.where(sd_ch > 5 * sd_global)[0]
+
+            # BANDE 15–45 Hz → absolute 60 µV
+            print("  → Checking 15–45 Hz >60 µV")
+            mid = band_extract(raw, 15, 45)
+            bad_15_45 = np.where(np.abs(mid).max(axis=1) > 60e-6)[0]
+
+            bad_ch = list(set(bad_1_15.tolist() + bad_15_45.tolist()))
+            bad_ch_names = [raw.ch_names[i] for i in bad_ch]
+
+            # Check 50% rule
+            final_bad = []
+            for idx in bad_ch:
+                if np.mean(np.abs(data[idx]) > 60e-6) > 0.5:
+                    final_bad.append(raw.ch_names[idx])
+
+            if final_bad:
+                print("  → Dropping and interpolating:", final_bad)
+                raw.info["bads"] = final_bad
+                raw.interpolate_bads()
+
+            out_subdir = OUT_DIR / subj
+            out_subdir.mkdir(exist_ok=True)
+            out_path = out_subdir / f"{cond}_reref_clean.fif"
+            raw.save(out_path, overwrite=True)
+            print("  ✔ Saved:", out_path)
+
+
+if __name__ == "__main__":
+    step5_reref()
