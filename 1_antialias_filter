@@ -1,0 +1,55 @@
+#here, the stimulation artifact has already been identified, interpolated and data has been downsampled to 1000Hz (see ESG preprocessing, steps 1-3)
+# 1_eeg_antialias_filter.py
+"""
+Paso EEG-1: Anti-aliasing FIR filter (cutoff = 0.9 nyquist, tbw = 0.2 nyquist)
+En fs=1000 Hz → cutoff=450 Hz, transition=100 Hz.
+
+Entrada:
+  eeg_1000Hz_noStimArt/sub-XXX/...fif
+Salida:
+  eeg_step1_antialias/sub-XXX/..._aa.fif
+"""
+
+from pathlib import Path
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "eeg_1000Hz_noStimart"
+OUT_DIR = BASE / "eeg_step1_antialias"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+TASK_LIST = ["median", "tibial"]  # ajusta según tus condiciones
+
+def step1_antialias(subjects=range(1, 10)):
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        subj_dir = IN_DIR / subj
+        if not subj_dir.exists():
+            continue
+
+        fif_files = sorted(subj_dir.glob("*.fif"))
+        if not fif_files:
+            continue
+
+        print(f"\n===== {subj} =====")
+        for fif in fif_files:
+            print(f"  Loading {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True)
+
+            print("  → Applying anti-alias FIR low-pass: cutoff=450 Hz, transition=100 Hz")
+            raw.filter(
+                l_freq=None,
+                h_freq=450.0,
+                method="fir",
+                fir_design="firwin2",
+                verbose="error",
+            )
+
+            out_subdir = OUT_DIR / subj
+            out_subdir.mkdir(exist_ok=True)
+            out_path = out_subdir / fif.name.replace(".fif", "_aa.fif")
+            raw.save(out_path, overwrite=True)
+            print(f"  ✔ Saved: {out_path}")
+
+if __name__ == "__main__":
+    step1_antialias()
