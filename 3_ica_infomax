@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Dec  4 11:18:01 2025
+Created on Thu Dec  4 14:47:24 2025
 
 @author: navar
 """
 
+# -*- coding: utf-8 -*-
 """
-PASO EEG-3 — ICA TRAINING (según PLOS Biology)
+PASO EEG-3 — ICA TRAINING con EEG + ECG disponible
 
-1) Carga eeg_allblocks_05_45.fif (ya filtrado 0.5–45 Hz)
-2) Selecciona SOLO EEG
-3) Downsample a 250 Hz para hacer ICA estable y rápida
-4) Entrena ICA Infomax
-5) Guarda el ICA sin aplicarlo
-6) Guarda las fuentes
-
-NO SE APLICA ICA AQUÍ — SOLO ENTRENAMIENTO
+Entrenamiento ICA:
+  ✔ se entrena SOLO sobre EEG (64 canales)
+  ✔ pero se mantiene el canal ECG en el raw original
+  ✔ downsampling a 250 Hz para ICA
+  ✔ método INFOMAX (paper)
+  ✔ NO se aplica ICA aquí
 """
 
 from pathlib import Path
@@ -46,29 +45,44 @@ def step3_ica_training(subjects=range(1, 50)):
         if not fif_path.exists():
             continue
 
-        print(f"\n===== {subj} — ICA training =====")
-        raw = mne.io.read_raw_fif(fif_path, preload=False, verbose="warning")
+        print(f"\n===== {subj} — ICA TRAINING =====")
 
-        # seleccionar solo EEG
-        eeg_chs = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
-        raw.pick(eeg_chs)
+        # ----------------------------
+        # 1) Load full continuous signal
+        # ----------------------------
+        raw = mne.io.read_raw_fif(fif_path, preload=False, verbose="warning")
         raw.load_data()
 
-        # Downsample para ICA
-        print("→ Downsampling to 250 Hz for ICA stability...")
-        raw_resamp = raw.copy().resample(250)
+        # ----------------------------
+        # 2) Select only EEG for ICA training
+        # ----------------------------
+        eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
+        if len(eeg_ch) == 0:
+            print("⚠ No EEG channels found — skipping")
+            continue
 
-        # ICA Infomax
+        raw_eeg = raw.copy().pick(eeg_ch)
+
+        # ----------------------------
+        # 3) Resample to 250 Hz for ICA stability
+        # ----------------------------
+        print("→ Downsampling EEG to 250 Hz...")
+        raw_eeg_resamp = raw_eeg.copy().resample(250, npad="auto")
+
+        # ----------------------------
+        # 4) ICA INFOMAX training
+        # ----------------------------
+        print("→ Fitting ICA (Infomax)...")
         ica = mne.preprocessing.ICA(
             method="infomax",
             max_iter="auto",
             random_state=97
         )
+        ica.fit(raw_eeg_resamp)
 
-        print("→ Fitting ICA...")
-        ica.fit(raw_resamp)
-
-        # ---------------- SAVE ICA -------------------
+        # ----------------------------
+        # 5) Save ICA + sources
+        # ----------------------------
         out_sub = OUT_DIR / subj
         out_sub.mkdir(exist_ok=True, parents=True)
 
@@ -76,12 +90,14 @@ def step3_ica_training(subjects=range(1, 50)):
         ica.save(ica_path)
         print("✔ ICA saved:", ica_path)
 
-        # guardar las fuentes para inspección (opcional)
-        src = ica.get_sources(raw_resamp)
+        sources = ica.get_sources(raw_eeg_resamp)
         src_path = out_sub / "ica_sources_raw.fif"
-        src.save(src_path, overwrite=True)
+        sources.save(src_path, overwrite=True)
         print("✔ ICA sources saved:", src_path)
+
+        print("✓ ICA TRAINING COMPLETE for", subj)
 
 
 if __name__ == "__main__":
     step3_ica_training()
+
