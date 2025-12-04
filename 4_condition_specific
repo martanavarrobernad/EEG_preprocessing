@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec  4 11:18:50 2025
+
+@author: navar
+"""
+
+"""
+PASO EEG-4 — CONDITION-SPECIFIC CLEANING
+
+Basado EXACTAMENTE en el pipeline descrito en PLOS Biology:
+
+  * ICA se entrena sobre señal 0.5–45 (Paso 3)
+  * PERO ICA se APLICA sobre la señal filtrada 30–400 por condición
+
+Pipeline Step 4 según paper:
+  1) Concatenar solo la condición (median o tibial)
+  2) Filtro notch 48–53 Hz
+  3) Band-pass 30–400 Hz
+  4) Aplicar ICA (exclude = ICs malos)
+  5) Rereference → average
+  6) Detectar puntos malos:
+        1–15 Hz  → threshold 5 × SD
+        15–45 Hz → threshold 60 μV
+  7) Si >50% malos → eliminar canal y interpolar
+  8) Guardar datos limpios por condición
+
+Salida:
+  eeg_step4_condition_cleaned/sub-XXX/<cond>_clean.fif
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+import pandas as pd
+import re
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+EEG_SRC = BASE / "eeg_1000Hz_noStimart"
+ICA_DIR = BASE / "eeg_step3_ica"
+OUT_DIR = BASE / "eeg_step4_condition_cleaned"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+CONDITIONS = ["median"]
+
+# CSV definible por ti:
+BAD_IC_CSV = BASE / "bad_ica_components.csv"
+
+EEG_CHANNELS = [...]  # MISMA LISTA DEL PASO 3
+
+
+def load_bad_ics():
+    if not BAD_IC_CSV.exists():
+        print("⚠ No IC CSV found — using empty exclude list.")
+        return {}
+
+    df = pd.read_csv(BAD_IC_CSV)
+    d = {}
+    for _, row in df.iterrows():
+        subj = row["subject"]
+        if isinstance(row["bad_ics"], str):
+            d[subj] = [int(x) for x in row["bad_ics"].split(";")]
+        else:
+            d[subj] = []
+    return d
+
+
+
+# -----------------------------------------------------------
+#   DETECTAR PUNTOS MALOS CON DOS UMBRALES (según paper)
+# -----------------------------------------------------------
+def detect_noisy_points(raw, eeg_picks):
+    data = raw.get_data(picks=eeg_picks)
+    sfreq = raw.info["sfreq"]
+
+    # Filtros auxiliares para detección
+    low_band = mne.filter.filter_data(data, sfreq, 1, 15)
+    high_band = mne.filter.filter_data(data, sfreq, 15, 45)
+
+    # thresholds
+    mask_low = np.abs(low_band) > (5 * np.std(low_band, axis=1, keepdims=True))
+    mask_high = np.abs(high_band) > 60e-6  # 60 µV
+
+    bad_mask = np.logical_or(mask_low, mask_high).any(axis=0)
+    return bad_mask
+
+
+
+def step4_clean(subjects=range(1, 50)):
+    bad_ics = load_bad_ics()
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        ica_path = ICA_DIR / subj / "ica_fitted.fif"
+        if not ica_path.exists():
+            continue
+
+        print(f"\n===== {subj} CONDITION CLEANING =====")
+        ica = mne.preprocessing.read_ica(ica_path)
+
+        for cond in CONDITIONS:
+            cond_dir = EEG_SRC / subj
+            fif_files = sorted(cond_dir.glob(f"*task-{cond}*_run-*.fif"))
+            if not fif_files:
+                continue
+
+            raws = []
+            for fif in fif_files:
+                print(f"→ Load {fif.name}")
+                r = mne.io.read_raw_fif(fif, preload=True, verbose="error")
+
+                # pick EEG only
+                eeg_ch = [ch for ch in EEG_CHANNELS if ch in r.ch_names]
+                r.pick(eeg_ch)
+
+                raws.append(r)
+
+            raw = mne.concatenate_raws(raws)
+
+            # ---------------- FILTERING ----------------
+            print("→ Notch 48–53 Hz")
+            raw.notch_filter(freqs=[50], notch_widths=5, method="iir")
+
+            print("→ Band-pass 30–400 Hz")
+            raw.filter(
+                30, 400,
+                method="iir",
+                iir_params=dict(order=4, ftype="butter"),
+                phase="zero"
+            )
+
+            # ---------------- APPLY ICA ----------------
+            exclude = bad_ics.get(subj, [])
+            print("→ Applying ICA — excluding:", exclude)
+            ica.apply(raw, exclude=exclude)
+
+            # ---------------- REREFERENCE ----------------
+            print("→ Re-referencing to average...")
+            raw.set_eeg_reference("average")
+
+            # ---------------- DETECT BAD TIME PERIODS ----------------
+            eeg_picks = mne.pick_channels(raw.ch_names, include=EEG_CHANNELS)
+            bad_mask = detect_noisy_points(raw, eeg_picks)
+
+            ratio = bad_mask.mean()
+            print(f"→ Fraction of bad samples: {ratio:.3f}")
+
+            if ratio > 0.5:
+                print("⚠ Too many noisy samples — removing channel entirely.")
+                raw.info["bads"].extend([raw.ch_names[i] for i in eeg_picks])
+                raw.interpolate_bads()
+
+            # ---------------- SAVE ----------------
+            out_sub = OUT_DIR / subj
+            out_sub.mkdir(exist_ok=True, parents=True)
+
+            out_fif = out_sub / f"{cond}_clean.fif"
+            raw.save(out_fif, overwrite=True)
+            print("✔ Saved:", out_fif)
+
+
+if __name__ == "__main__":
+    step4_clean()
