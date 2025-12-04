@@ -1,0 +1,195 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec  4 17:39:20 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+PASO EEG-3 — ICA TRAINING (estilo loop6 de Birgit, con control de memoria)
+--------------------------------------------------------------------------
+
+Entrenamiento ICA:
+  ✔ Señal ya concatenada por sujeto (todos los bloques/condiciones)
+      -> eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
+  ✔ Se entrena SOLO sobre EEG (64 canales de scalp)
+  ✔ ECG está en el raw, pero NO entra en ICA
+  ✔ Recorta la señal a máx MAX_DUR_SEC (p.ej. 600 s = 10 min)
+  ✔ Downsampling a 250 Hz para ICA (SRATE_ICA)
+  ✔ Método INFOMAX EXTENDED (como pop_runica 'runica', 'extended' 1)
+  ✔ n_components = rango EEG estimado (equivalente a su 'pca = dataRank')
+  ✔ decim durante ICA para ahorrar memoria
+  ✔ NO se aplica ICA aquí, solo se guarda (ica_fitted_sr250Hz.fif)
+"""
+
+from pathlib import Path
+import mne
+
+# ================================================================
+# CONFIGURACIÓN DE RUTAS Y CANALES
+# ================================================================
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+# Directorio con datos concatenados 0.5–45 Hz por sujeto
+IN_DIR = BASE / "eeg_step2_clean_concat_05_45"
+
+# Directorio de salida para ICA
+OUT_DIR = BASE / "eeg_step3_ica"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+# Nombre del canal ECG en tus FIF (no entra en ICA)
+ECG_CH_NAME = "ECG"
+
+# Lista de tus 64 canales EEG reales (easycap-M1, sin ECG)
+EEG_CHANNELS = [
+    "Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
+    "F7","F8","T7","T8","P7","P8","AFz","Fz","Cz","Pz",
+    "FC1","FC2","CP1","CP2","FC5","FC6","CP5","CP6",
+    "FT9","FT10","FCz","F1","F2","C1","C2","P1","P2",
+    "AF3","AF4","FC3","FC4","CP3","CP4","PO3","PO4",
+    "F5","F6","C5","C6","P5","P6","AF7","AF8","FT7","FT8",
+    "TP7","TP8","PO7","PO8","FPz","CPz","F9","F10"
+]
+
+# Frecuencia de muestreo para ICA (equivalente a srate_ica en cfg.mat)
+SRATE_ICA = 250.0
+
+# Máxima duración de datos usada para entrenar ICA (segundos)
+MAX_DUR_SEC = 600.0   # 10 minutos (ajusta si quieres más/menos)
+
+# Factor de decimado durante ICA (MNE salta muestras internamente)
+ICA_DECIM = 3        # 3 → usa 1 de cada 3 muestras durante el fit
+
+
+# ================================================================
+# FUNCIÓN PRINCIPAL
+# ================================================================
+def step3_ica_training(subjects=range(1, 50)):
+    """
+    Entrena ICA Infomax extended para cada sujeto en `subjects`.
+
+    - Carga eeg_allblocks_05_45.fif del sujeto (sin preload).
+    - Recorta a MAX_DUR_SEC (para no usar todo si es muy largo).
+    - Carga datos a memoria solo después de recortar.
+    - Selecciona solo canales EEG (EEG_CHANNELS).
+    - Remuestrea a SRATE_ICA.
+    - Estima rango EEG y lo usa como n_components (PCA).
+    - Ajusta ICA (Infomax extended) sobre EEG, con decim para ahorrar memoria.
+    - Guarda ica_fitted_sr250Hz.fif y las fuentes proyectadas
+      sobre el EEG resampleado (ica_sources_raw_sr250Hz.fif).
+    """
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        fif_path = IN_DIR / subj / "eeg_allblocks_05_45.fif"
+        if not fif_path.exists():
+            print(f"⚠ No data for {subj}, skipping. ({fif_path} not found)")
+            continue
+
+        print(f"\n===== {subj} — ICA TRAINING (EEG-only, ECG present, mem-safe) =====")
+
+        # --------------------------------------------------
+        # 1) Cargar señal continua SIN preload (para recortar antes)
+        # --------------------------------------------------
+        raw = mne.io.read_raw_fif(fif_path, preload=False, verbose="warning")
+
+        # Duración total en segundos (sin cargar datos)
+        total_dur = raw.times[-1]
+        print(f"   Total duration: {total_dur:.1f} s")
+
+        # Recortar a los primeros MAX_DUR_SEC segundos para entrenar ICA
+        if total_dur > MAX_DUR_SEC:
+            print(f"→ Cropping to first {MAX_DUR_SEC:.1f} s for ICA training.")
+            raw.crop(tmin=0.0, tmax=MAX_DUR_SEC)
+
+        # Ahora sí cargamos datos recortados a memoria
+        raw.load_data()
+
+        # --------------------------------------------------
+        # 2) Seleccionar solo EEG para ICA (equivalente a chanind sin ECG)
+        # --------------------------------------------------
+        eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
+        if len(eeg_ch) == 0:
+            print(f"⚠ No EEG channels from EEG_CHANNELS found in {subj} — skipping.")
+            continue
+
+        print(f"→ Using {len(eeg_ch)} EEG channels for ICA.")
+        raw_eeg = raw.copy().pick(eeg_ch)
+
+        # --------------------------------------------------
+        # 3) Resample EEG a SRATE_ICA para ICA
+        # --------------------------------------------------
+        current_sfreq = raw_eeg.info["sfreq"]
+        if current_sfreq > SRATE_ICA + 1e-6:
+            print(f"→ Downsampling EEG from {current_sfreq:.1f} Hz to {SRATE_ICA:.1f} Hz...")
+            raw_eeg_resamp = raw_eeg.copy().resample(SRATE_ICA, npad="auto")
+        else:
+            print(f"→ EEG already at {current_sfreq:.1f} Hz or lower; no downsampling.")
+            raw_eeg_resamp = raw_eeg.copy()
+
+        # --------------------------------------------------
+        # 4) Estimar rango de los datos EEG (PCA)
+        #    usando compute_rank sin 'picks' (compatible con MNE antiguos)
+        # --------------------------------------------------
+        print("→ Estimating EEG rank for PCA (MNE compute_rank)...")
+        try:
+            rank_res = mne.compute_rank(raw_eeg_resamp, tol="auto")
+            # MNE moderno devuelve un dict por tipo; versiones antiguas pueden devolver int
+            if isinstance(rank_res, dict):
+                data_rank = rank_res.get("eeg", len(eeg_ch))
+            else:
+                data_rank = int(rank_res)
+        except TypeError:
+            # Versión muy vieja sin 'tol' o firma distinta
+            print("⚠ compute_rank signature not compatible, falling back to n_channels as rank.")
+            data_rank = len(eeg_ch)
+        except MemoryError:
+            print("⚠ MemoryError in compute_rank, falling back to n_channels as rank.")
+            data_rank = len(eeg_ch)
+
+        print(f"   Estimated EEG rank: {data_rank} (out of {len(eeg_ch)} channels)")
+
+        # --------------------------------------------------
+        # 5) Ajustar ICA INFOMAX EXTENDED con PCA = data_rank
+        #    usando decim para ahorrar memoria
+        # --------------------------------------------------
+        print(f"→ Fitting ICA (Infomax extended) with decim={ICA_DECIM}...")
+        ica = mne.preprocessing.ICA(
+            method="infomax",
+            n_components=data_rank,   # PCA al rango estimado
+            max_iter="auto",
+            random_state=97,
+            fit_params=dict(extended=True)  # extended Infomax como 'extended',1
+        )
+
+        # decim hace que ICA vea 1 de cada ICA_DECIM muestras,
+        # reduciendo tamaño interno y memoria.
+        ica.fit(raw_eeg_resamp, decim=ICA_DECIM)
+
+        # --------------------------------------------------
+        # 6) Guardar ICA y, opcionalmente, las fuentes
+        # --------------------------------------------------
+        out_sub = OUT_DIR / subj
+        out_sub.mkdir(exist_ok=True, parents=True)
+
+        ica_path = out_sub / f"ica_fitted_sr{int(SRATE_ICA)}Hz.fif"
+        ica.save(ica_path)
+        print("✔ ICA saved:", ica_path)
+
+        # Opcional: guardar las fuentes ICA sobre el EEG resampleado
+        # (si vas muy justo de memoria, puedes comentar esta parte)
+        sources = ica.get_sources(raw_eeg_resamp)
+        src_path = out_sub / f"ica_sources_raw_sr{int(SRATE_ICA)}Hz.fif"
+        sources.save(src_path, overwrite=True)
+        print("✔ ICA sources saved:", src_path)
+
+        print("✓ ICA TRAINING COMPLETE for", subj)
+
+
+# ================================================================
+# MAIN
+# ================================================================
+if __name__ == "__main__":
+    # Ajusta el rango de sujetos que quieras procesar
+    step3_ica_training(subjects=range(1, 50))
