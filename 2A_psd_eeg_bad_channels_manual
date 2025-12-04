@@ -142,7 +142,7 @@ def eeg_psd_click_inspection(subjects=range(1, 10)):
                 print("   ⚠ No EEG channels found in this file.")
                 continue
 
-            raw.pick(eeg_ch)
+            raw_eeg = raw.copy().pick(eeg_ch)
 
             # PSD interactivo
             print("   → Mostrando PSD...")
