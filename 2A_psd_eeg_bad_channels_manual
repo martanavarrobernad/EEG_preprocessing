@@ -1,0 +1,175 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec  4 10:34:20 2025
+
+@author: navar
+"""
+
+"""
+EEG — Inspección visual de canales ruidosos mediante PSD interactivo.
+Clic para marcar canales malos (igual que en ESG paso 5).
+
+Salida:
+  bad_eeg_channels_from_psd_clicks.csv
+
+Funcionamiento:
+  - Abre una figura con la PSD (solo 64 EEG reales)
+  - Haz clic en las curvas que quieras marcar como malas
+  - Cada clic alterna entre "bueno" y "malo"
+  - Cierra la ventana → guarda resultado
+"""
+
+from pathlib import Path
+import re
+import csv
+
+import matplotlib.pyplot as plt
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+IN_DIR = BASE / "eeg_step1_antialias"
+OUTPUT_CSV = BASE / "bad_eeg_channels_from_psd_clicks.csv"
+
+# ==========================
+# ✔ Tus 64 canales EEG reales
+# ==========================
+EEG_CHANNELS = [
+    "Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
+    "F7","F8","T7","T8","P7","P8","AFz","Fz","Cz","Pz",
+    "FC1","FC2","CP1","CP2","FC5","FC6","CP5","CP6",
+    "FT9","FT10","FCz","F1","F2","C1","C2","P1","P2",
+    "AF3","AF4","FC3","FC4","CP3","CP4","PO3","PO4",
+    "F5","F6","C5","C6","P5","P6","AF7","AF8","FT7","FT8",
+    "TP7","TP8","PO7","PO8","FPz","CPz","F9","F10"
+]
+
+
+def find_eeg_runs(subject: int):
+    subj = f"sub-{subject:03d}"
+    subj_dir = IN_DIR / subj
+    return sorted(subj_dir.glob("*_aa.fif"))
+
+
+# ==========================
+#   INTERACCIÓN PSD
+# ==========================
+def interactive_psd_bad_selection(raw, picks, fmin=0.5, fmax=45):
+    """Igual que ESG, pero versión EEG."""
+    plt.ioff()  # bloqueante controlado
+
+    psd = raw.compute_psd(
+        picks=picks,
+        fmin=fmin,
+        fmax=fmax,
+        method="welch",
+        n_fft=2048,
+    )
+    psds, freqs = psd.get_data(return_freqs=True)
+
+    fig, ax = plt.subplots()
+    ax.set_title("PSD EEG (clic para marcar canales malos)")
+    ax.set_xlabel("Frecuencia (Hz)")
+    ax.set_ylabel("Potencia (uV^2/Hz)")
+    ax.set_xscale("log")
+    ax.set_xlim((fmin, fmax))
+
+    lines = []
+    bad_channels = set()
+
+    for ch_idx, ch_name in enumerate(psd.ch_names):
+        line, = ax.plot(
+            freqs,
+            psds[ch_idx],
+            label=ch_name,
+            picker=True,
+            pickradius=5,
+        )
+        lines.append(line)
+
+    ax.legend(loc="best", fontsize="small")
+
+    def toggle_bad(line):
+        ch_name = line.get_label()
+        if ch_name in bad_channels:
+            bad_channels.remove(ch_name)
+            line.set_linewidth(1.0)
+            line.set_alpha(1.0)
+        else:
+            bad_channels.add(ch_name)
+            line.set_linewidth(3.0)
+            line.set_alpha(0.3)
+
+    def on_pick(event):
+        line = event.artist
+        toggle_bad(line)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("pick_event", on_pick)
+
+    print("   → Clic en las curvas para marcar canales malos.")
+    print("     Cierra la ventana cuando termines con este run.")
+
+    plt.show(block=True)
+    plt.close(fig)
+
+    return sorted(bad_channels)
+
+
+# ==========================
+#   PIPELINE PRINCIPAL
+# ==========================
+def eeg_psd_click_inspection(subjects=range(1, 10)):
+    rows = []
+
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        fif_files = find_eeg_runs(s)
+
+        if not fif_files:
+            print(f"{subj_id}: no EEG aa files.")
+            continue
+
+        print(f"\n===== {subj_id} =====")
+
+        for fif in fif_files:
+            print(f"  Loading {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose='warning')
+
+            # solo EEG existentes
+            eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
+            if not eeg_ch:
+                print("   ⚠ No EEG channels found in this file.")
+                continue
+
+            raw.pick(eeg_ch)
+
+            # PSD interactivo
+            print("   → Mostrando PSD...")
+            bad_ch = interactive_psd_bad_selection(raw, eeg_ch)
+
+            # detectar run
+            m = re.search(r"run-(\d+)", fif.name)
+            run_num = int(m.group(1)) if m else -1
+
+            bad_str = ";".join(bad_ch)
+            print(f"   → Seleccionados {bad_str}")
+
+            rows.append((subj_id, run_num, bad_str))
+
+    if rows:
+        print(f"\nEscribiendo CSV → {OUTPUT_CSV}")
+        with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["subject", "run", "bad_channels"])
+            for r in rows:
+                w.writerow(r)
+        print("Hecho.")
+    else:
+        print("\nNo se seleccionaron canales malos → no se crea CSV.")
+
+
+# ==========================
+if __name__ == "__main__":
+    # Cambia range según quieras
+    eeg_psd_click_inspection(range(1, 5))
