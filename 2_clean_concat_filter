@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Dec  4 11:03:35 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
 EEG - Paso 2 (2B + 2C):
 
   2B_build_bad_list:
@@ -135,7 +142,10 @@ def step2_clean_and_concat(subjects=range(1, 10), rms_thresh_factor=5.0):
         # --------------- 2B: auto RMS por bloque ---------------
         for fif in fif_files:
             print(f"  Loading {fif.name}")
-            raw_block = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+            raw_block = mne.io.read_raw_fif(fif, preload=False, verbose="warning")
+            eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw_block.ch_names]
+            raw_block.pick(eeg_ch)
+            raw_block.load_data()
 
             # AUTO RMS (solo EEG)
             bad_rms = detect_bad_by_rms(raw_block, rms_thresh_factor)
@@ -225,4 +235,5 @@ def step2_clean_and_concat(subjects=range(1, 10), rms_thresh_factor=5.0):
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     step2_clean_and_concat()
+
 
