@@ -1,0 +1,394 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec  4 17:07:59 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+STEP 3B — Selección de ICs con ayuda de correlaciones EOG/ECG (estilo SASICA)
+-----------------------------------------------------------------------------
+
+Para cada sujeto:
+  1) Carga:
+       - raw continuo 0.5–45 Hz:
+           eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
+       - ICA entrenada (solo EEG):
+           eeg_step3_ica/sub-XXX/ica_fitted.fif
+
+  2) Calcula correlación de cada IC con:
+       - ECG
+       - VEOG (Fp1/Fp2)
+       - HEOG (F7/F8)
+
+  3) Imprime tabla de correlaciones y sugiere ICs sospechosos.
+
+  4) Dibuja:
+       - topoplots de TODOS los ICs
+       - trazas de ICs en una ventana corta
+
+  5) Pide por consola qué ICs marcar como malos.
+
+  6) Guarda bad_ica_components.csv con columnas:
+        subject, bad_ics
+"""
+
+from pathlib import Path
+from math import ceil
+
+import mne
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ================================================================
+# CONFIGURACIÓN GENERAL
+# ================================================================
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+IN_DATA = BASE / "eeg_step2_clean_concat_05_45"
+IN_ICA  = BASE / "eeg_step3_ica"
+OUT_CSV = BASE / "bad_ica_components.csv"
+
+# Nombres de canales (ajusta si hace falta)
+ECG_CH_NAME = "ECG"
+VEOG_CHS    = ("Fp1", "Fp2")   # vertical
+HEOG_CHS    = ("F7", "F8")     # horizontal
+
+# Umbral por defecto de correlación absoluta para sugerir ICs sospechosos
+DEFAULT_CORR_THRESH = 0.3
+
+
+# ================================================================
+# UTILIDADES BÁSICAS
+# ================================================================
+def load_raw_and_ica(subj: str):
+    """
+    Carga raw continuo y la ICA entrenada.
+    """
+    fif_path = IN_DATA / subj / "eeg_allblocks_05_45.fif"
+    ica_path = IN_ICA  / subj / "ica_fitted.fif"
+
+    if not fif_path.exists():
+        print(f" ⚠ No EEG data for {subj}: {fif_path}")
+        return None, None
+    if not ica_path.exists():
+        print(f" ⚠ No ICA for {subj}: {ica_path}")
+        return None, None
+
+    print(f" → Loading raw: {fif_path.name}")
+    raw = mne.io.read_raw_fif(fif_path, preload=True, verbose="warning")
+
+    print(f" → Loading ICA: {ica_path.name}")
+    ica = mne.preprocessing.read_ica(ica_path, verbose="warning")
+
+    return raw, ica
+
+
+def make_raw_eeg_from_ica(raw, ica):
+    """
+    Crea una copia de raw que contenga SOLO los canales usados en la ICA
+    (ica.ch_names) y les asigna el montaje easycap-M1.
+
+    Esto garantiza:
+      - n_canales de raw_eeg == n_filas de ica.get_components()
+      - raw_eeg.info tiene solo EEG (sin ECG, EMG, etc.)
+    """
+    ica_chs = ica.ch_names  # canales EEG usados en el fit
+
+    # Comprobar que todos están en raw
+    missing = [ch for ch in ica_chs if ch not in raw.ch_names]
+    if missing:
+        raise RuntimeError(f"Canales de ICA no presentes en raw: {missing}")
+
+    # Copiar solo esos canales, en el MISMO orden que ICA
+    raw_eeg = raw.copy().pick(ica_chs)
+
+    print(" → Setting easycap-M1 montage on EEG channels (ICA channels)...")
+    montage = mne.channels.make_standard_montage("easycap-M1")
+    raw_eeg.set_montage(montage, on_missing="ignore")
+
+    return raw_eeg
+
+
+def plot_ic_topomaps(ica, raw_eeg):
+    """
+    Dibuja topoplots de TODOS los ICs usando mne.viz.plot_topomap.
+
+    IMPORTANTE:
+      - components.shape = (n_ch_ica, n_ic)
+      - raw_eeg.info tiene exactamente esos n_ch_ica canales (mismo orden)
+    """
+    components = ica.get_components()  # (n_ch_ica, n_ic)
+    n_ch, n_ic = components.shape
+
+    n_cols = 5
+    n_rows = ceil(n_ic / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(3.0 * n_cols, 3.0 * n_rows)
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    print(" → Plotting IC topographies (easycap-M1)...")
+
+    for ic_idx in range(n_ic):
+        ax = axes[ic_idx]
+        topo = components[:, ic_idx]  # vector (n_ch,)
+
+        mne.viz.plot_topomap(
+            data=topo,
+            pos=raw_eeg.info,    # Info con SOLO EEG + montage
+            ch_type="eeg",
+            sensors=True,
+            contours=0,
+            cmap="RdBu_r",
+            outlines="head",
+            axes=ax,
+            show=False,
+        )
+        ax.set_title(f"IC {ic_idx}", fontsize=8)
+
+    # Apagar ejes sobrantes
+    for ax in axes[n_ic:]:
+        ax.axis("off")
+
+    fig.suptitle("ICA topographies (easycap-M1)", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def make_raw_view_for_traces(raw_eeg, win_len=20.0, target_sfreq=200.0):
+    """
+    Crea una copia ligera de raw_eeg para trazar las ICs:
+
+      - Ventana centrada de ~win_len segundos
+      - Resample a target_sfreq (p.ej. 200 Hz)
+
+    NO altera raw_eeg original.
+    """
+    duration = raw_eeg.times[-1]  # en segundos
+
+    if duration <= win_len:
+        raw_view = raw_eeg.copy()
+    else:
+        mid = duration / 2.0
+        tmin = max(0.0, mid - win_len / 2.0)
+        tmax = min(duration, mid + win_len / 2.0)
+        raw_view = raw_eeg.copy().crop(tmin=tmin, tmax=tmax)
+
+    if raw_view.info["sfreq"] > target_sfreq:
+        print(f" → Resampling EEG view from {raw_view.info['sfreq']:.1f} Hz to {target_sfreq} Hz")
+        raw_view.resample(target_sfreq)
+
+    return raw_view
+
+
+def plot_ic_traces(ica, raw_view):
+    """
+    Muestra las series temporales de los ICs sobre raw_view.
+    """
+    print(" → Plotting IC time series (short window)...")
+    plt.ioff()
+    fig = ica.plot_sources(raw_view, show_scrollbars=True)
+    plt.show(block=True)
+    plt.close(fig)
+
+
+# ================================================================
+# CORRELACIONES TIPO SASICA (ECG / VEOG / HEOG)
+# ================================================================
+def _safe_corr(x, y):
+    """
+    Correlación de Pearson segura entre dos vectores 1D.
+    Devuelve 0 si alguna varianza es 0 o si hay NaNs.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+
+    if x.size != y.size or x.size == 0:
+        return 0.0
+
+    x_mean = x.mean()
+    y_mean = y.mean()
+    x_std = x.std()
+    y_std = y.std()
+
+    if x_std == 0 or y_std == 0:
+        return 0.0
+
+    r = np.dot(x - x_mean, y - y_mean) / (x_std * y_std * x.size)
+    if np.isnan(r):
+        return 0.0
+    return float(r)
+
+def suggest_bad_ics_by_corr(raw, ica,
+                            ecg_ch=ECG_CH_NAME,
+                            veog_chs=VEOG_CHS,
+                            heog_chs=HEOG_CHS,
+                            n_sd_ecg=1.0,
+                            n_sd_eog=4.0):
+    """
+    Calcula la correlación de cada IC con:
+        - ECG
+        - VEOG (Fp1/Fp2)
+        - HEOG (F7/F8)
+
+    Y aplica umbrales tipo SASICA:
+        - ECG  : |corr| > media + n_sd_ecg * SD
+        - VEOG : |corr| > media + n_sd_eog * SD
+        - HEOG : igual
+
+    Devuelve:
+        bad_ecg, bad_veog, bad_heog
+    """
+
+    print("\n → Computing IC correlations with ECG / VEOG / HEOG...")
+
+    # Señales de IC: (n_ic, n_samples)
+    src = ica.get_sources(raw).get_data()
+    n_ic, _ = src.shape
+    ch_names = raw.ch_names
+
+    def _get_ref_signal(chs):
+        idx = [ch_names.index(c) for c in chs if c in ch_names]
+        if not idx:
+            return None
+        data = raw.get_data(picks=idx)  # (n_ch_ref, n_samples)
+        return data.mean(axis=0)
+
+    ecg_sig  = _get_ref_signal((ecg_ch,))
+    veog_sig = _get_ref_signal(veog_chs)
+    heog_sig = _get_ref_signal(heog_chs)
+
+    corr_ecg  = np.zeros(n_ic)
+    corr_veog = np.zeros(n_ic)
+    corr_heog = np.zeros(n_ic)
+
+    for i in range(n_ic):
+        if ecg_sig is not None:
+            corr_ecg[i] = _safe_corr(src[i], ecg_sig)
+        if veog_sig is not None:
+            corr_veog[i] = _safe_corr(src[i], veog_sig)
+        if heog_sig is not None:
+            corr_heog[i] = _safe_corr(src[i], heog_sig)
+
+    def _auto_bad(corr_vec, n_sd):
+        """Devuelve índices con |corr| > media + n_sd * SD."""
+        a = np.abs(corr_vec)
+        m = a.mean()
+        s = a.std()
+        if s == 0:
+            return np.array([], dtype=int), m, s
+        thr = m + n_sd * s
+        idx = np.where(a > thr)[0]
+        return idx, m, s
+
+    bad_ecg,  m_ecg,  s_ecg  = _auto_bad(corr_ecg,  n_sd_ecg)
+    bad_veog, m_veog, s_veog = _auto_bad(corr_veog, n_sd_eog)
+    bad_heog, m_heog, s_heog = _auto_bad(corr_heog, n_sd_eog)
+
+    print("\n=== IC correlations ===")
+    print("IC\tcorr_ECG\tcorr_VEOG\tcorr_HEOG")
+    for i in range(n_ic):
+        print(f"{i:02d}\t{corr_ecg[i]: .3f}\t\t{corr_veog[i]: .3f}\t\t{corr_heog[i]: .3f}")
+
+    print("\nRangos de correlación (abs):")
+    print(f"  ECG : min={np.abs(corr_ecg).min():.3f}, max={np.abs(corr_ecg).max():.3f}, "
+          f"mean={np.abs(corr_ecg).mean():.3f}, sd={np.abs(corr_ecg).std():.3f}")
+    print(f"  VEOG: min={np.abs(corr_veog).min():.3f}, max={np.abs(corr_veog).max():.3f}, "
+          f"mean={np.abs(corr_veog).mean():.3f}, sd={np.abs(corr_veog).std():.3f}")
+    print(f"  HEOG: min={np.abs(corr_heog).min():.3f}, max={np.abs(corr_heog).max():.3f}, "
+          f"mean={np.abs(corr_heog).mean():.3f}, sd={np.abs(corr_heog).std():.3f}")
+
+    print("\n=== Suggested ICs (auto SD thresholds, estilo SASICA) ===")
+    print(f"  Cardiaco (ECG, > {n_sd_ecg:.1f} SD):   {bad_ecg.tolist()}")
+    print(f"  Oculares (VEOG, > {n_sd_eog:.1f} SD):  {bad_veog.tolist()}")
+    print(f"  Oculares (HEOG, > {n_sd_eog:.1f} SD):  {bad_heog.tolist()}")
+
+    return bad_ecg, bad_veog, bad_heog
+
+
+
+# ================================================================
+# PIPELINE PRINCIPAL STEP 3B
+# ================================================================
+def step3b_mark_bad_ics(subjects=range(1, 5),
+                        corr_thresh=DEFAULT_CORR_THRESH):
+    """
+    Pipeline completo:
+      - Carga raw + ICA
+      - Calcula correlaciones IC–ECG/EOG
+      - Muestra sugerencias de ICs sospechosos
+      - Dibuja topomapas y trazas
+      - Permite introducir ICs malos a mano
+      - Guarda CSV con los ICs marcados
+    """
+    rows = []
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        print(f"\n========== {subj} — STEP 3B (IC selection with corr) ==========")
+
+        raw, ica = load_raw_and_ica(subj)
+        if raw is None or ica is None:
+            continue
+
+        # 1) Sugerencias automáticas tipo SASICA (correlaciones)
+        bad_ecg, bad_veog, bad_heog = suggest_bad_ics_by_corr(
+            raw, ica,
+            ecg_ch=ECG_CH_NAME,
+            veog_chs=VEOG_CHS,
+            heog_chs=HEOG_CHS,
+            n_sd_ecg=1.0,
+            n_sd_eog=4.0,
+        )
+
+        # 2) Construir raw_eeg con EXACTAMENTE los canales de la ICA + montaje
+        raw_eeg = make_raw_eeg_from_ica(raw, ica)
+
+        # 3) Topoplots de todos los ICs
+        plot_ic_topomaps(ica, raw_eeg)
+
+        # 4) Trazas de IC sobre ventana corta
+        raw_view = make_raw_view_for_traces(raw_eeg, win_len=20.0, target_sfreq=200.0)
+        plot_ic_traces(ica, raw_view)
+
+        # 5) Selección manual de ICs malos (con sugerencia)
+        print("\nIntroduce los índices de los ICs que quieres marcar como MALOS.")
+        print("Puedes guiarte por las sugerencias automáticas anteriores.")
+        print("Ejemplo: 0, 1, 7   (sin corchetes). ENTER = aceptar sólo los sugeridos.")
+        txt = input(f"ICs malos para {subj}: ").strip()
+
+        suggested_union = sorted(set(bad_ecg) | set(bad_veog) | set(bad_heog))
+
+        if txt:
+            manual = {int(t.strip()) for t in txt.split(",") if t.strip() != ""}
+            bad_ics = sorted(manual)
+        else:
+            bad_ics = suggested_union
+
+        print(f" → ICs finales marcados como malos para {subj}: {bad_ics}")
+
+        rows.append({
+            "subject": subj,
+            "bad_ics": ";".join(str(ic) for ic in bad_ics)
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(OUT_CSV, index=False)
+        print(f"\n✔ Saved bad ICs to: {OUT_CSV}")
+    else:
+        print("\n⚠ No bad ICs saved.")
+
+
+# ================================================================
+# MAIN
+# ================================================================
+if __name__ == "__main__":
+    # Ajusta el rango a los sujetos que quieras revisar
+    step3b_mark_bad_ics(subjects=range(1, 5),
+                        corr_thresh=0.3)
