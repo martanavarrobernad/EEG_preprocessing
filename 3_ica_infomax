@@ -1,10 +1,21 @@
-# 3_eeg_ica_infomax.py
+# -*- coding: utf-8 -*-
 """
-Paso EEG-3: ICA Infomax
-Entrada:
-   eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
-Salida:
-   eeg_step3_ica/sub-XXX/eeg_ica.fif  + eeg_ica_components.fif
+Created on Thu Dec  4 11:18:01 2025
+
+@author: navar
+"""
+
+"""
+PASO EEG-3 — ICA TRAINING (según PLOS Biology)
+
+1) Carga eeg_allblocks_05_45.fif (ya filtrado 0.5–45 Hz)
+2) Selecciona SOLO EEG
+3) Downsample a 250 Hz para hacer ICA estable y rápida
+4) Entrena ICA Infomax
+5) Guarda el ICA sin aplicarlo
+6) Guarda las fuentes
+
+NO SE APLICA ICA AQUÍ — SOLO ENTRENAMIENTO
 """
 
 from pathlib import Path
@@ -15,34 +26,62 @@ IN_DIR = BASE / "eeg_step2_clean_concat_05_45"
 OUT_DIR = BASE / "eeg_step3_ica"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
-def step3_ica(subjects=range(1, 10)):
+# Lista de tus 64 EEG reales
+EEG_CHANNELS = [
+    "Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
+    "F7","F8","T7","T8","P7","P8","AFz","Fz","Cz","Pz",
+    "FC1","FC2","CP1","CP2","FC5","FC6","CP5","CP6",
+    "FT9","FT10","FCz","F1","F2","C1","C2","P1","P2",
+    "AF3","AF4","FC3","FC4","CP3","CP4","PO3","PO4",
+    "F5","F6","C5","C6","P5","P6","AF7","AF8","FT7","FT8",
+    "TP7","TP8","PO7","PO8","FPz","CPz","F9","F10"
+]
+
+
+def step3_ica_training(subjects=range(1, 50)):
+
     for s in subjects:
         subj = f"sub-{s:03d}"
         fif_path = IN_DIR / subj / "eeg_allblocks_05_45.fif"
         if not fif_path.exists():
             continue
 
-        print(f"\n===== {subj} =====")
-        raw = mne.io.read_raw_fif(fif_path, preload=True)
+        print(f"\n===== {subj} — ICA training =====")
+        raw = mne.io.read_raw_fif(fif_path, preload=False, verbose="warning")
 
+        # seleccionar solo EEG
+        eeg_chs = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
+        raw.pick(eeg_chs)
+        raw.load_data()
+
+        # Downsample para ICA
+        print("→ Downsampling to 250 Hz for ICA stability...")
+        raw_resamp = raw.copy().resample(250)
+
+        # ICA Infomax
         ica = mne.preprocessing.ICA(
-            method="infomax", max_iter="auto", random_state=97
+            method="infomax",
+            max_iter="auto",
+            random_state=97
         )
-        print("  → Fitting ICA...")
-        ica.fit(raw)
 
+        print("→ Fitting ICA...")
+        ica.fit(raw_resamp)
+
+        # ---------------- SAVE ICA -------------------
         out_sub = OUT_DIR / subj
-        out_sub.mkdir(exist_ok=True)
+        out_sub.mkdir(exist_ok=True, parents=True)
 
-        ica_path = out_sub / "eeg_ica.fif"
+        ica_path = out_sub / "ica_fitted.fif"
         ica.save(ica_path)
-        print("  ✔ Saved ICA:", ica_path)
+        print("✔ ICA saved:", ica_path)
 
-        comp_raw = ica.get_sources(raw)
-        comp_path = out_sub / "eeg_ica_components.fif"
-        comp_raw.save(comp_path, overwrite=True)
-        print("  ✔ Saved ICA components:", comp_path)
+        # guardar las fuentes para inspección (opcional)
+        src = ica.get_sources(raw_resamp)
+        src_path = out_sub / "ica_sources_raw.fif"
+        src.save(src_path, overwrite=True)
+        print("✔ ICA sources saved:", src_path)
 
 
 if __name__ == "__main__":
-    step3_ica()
+    step3_ica_training()
