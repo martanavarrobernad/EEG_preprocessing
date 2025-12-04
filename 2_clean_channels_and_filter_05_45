@@ -1,16 +1,24 @@
-
+# -*- coding: utf-8 -*-
 """
-Paso EEG-2:
-  - Identificación de canales ruidosos (PSD + RMS)
-  - Interpolación
+Created on Thu Dec  4 10:21:28 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+PASO EEG-2 FINAL (v2025-12):
+  - Selección explícita de 64 canales EEG verdaderos
+  - Detección automática de malos por RMS (SOLO EEG)
+  - Integración con CSV manual (opcional)
+  - Interpolación segura (solo EEG, reset_bads=False)
   - Concatenación de todos los bloques (median + tibial)
-  - Filtro 0.5–45 Hz Butterworth 4th order (zero-phase)
+  - Filtro Butterworth 0.5–45 Hz (zero-phase)
 
 Entrada:
-  eeg_step1_antialias/sub-XXX/...
+  eeg_step1_antialias/sub-XXX/*_aa.fif
 Salida:
   eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
-  + CSV de canales malos si quieres registrarlo.
 """
 
 from pathlib import Path
@@ -18,6 +26,9 @@ import numpy as np
 import mne
 import pandas as pd
 
+# -------------------------------------------------------------------------
+# DIRECTORIOS
+# -------------------------------------------------------------------------
 BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 IN_DIR  = BASE / "eeg_step1_antialias"
 OUT_DIR = BASE / "eeg_step2_clean_concat_05_45"
@@ -25,28 +36,57 @@ OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 BAD_CSV = BASE / "bad_eeg_channels_manual.csv"
 
+# -------------------------------------------------------------------------
+# DEFINICIÓN FIJA DE TUS 64 CANALES EEG
+# (basado EXACTAMENTE en tu lista real)
+# -------------------------------------------------------------------------
+EEG_CHANNELS = [
+    "Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
+    "F7","F8","T7","T8","P7","P8","AFz","Fz","Cz","Pz",
+    "FC1","FC2","CP1","CP2","FC5","FC6","CP5","CP6",
+    "FT9","FT10","FCz","F1","F2","C1","C2","P1","P2",
+    "AF3","AF4","FC3","FC4","CP3","CP4","PO3","PO4",
+    "F5","F6","C5","C6","P5","P6","AF7","AF8","FT7","FT8",
+    "TP7","TP8","PO7","PO8","FPz","CPz","F9","F10"
+]
+
+# -------------------------------------------------------------------------
+# 1) DETECCIÓN AUTOMÁTICA DE MALOS (SOLO EEG)
+# -------------------------------------------------------------------------
 def detect_bad_by_rms(raw, thresh_factor=5):
-    """RMS por canal, marcar canales > thresh_factor × median RMS."""
-    data = raw.get_data()
+    """RMS por canal EEG; marca canales con RMS > k × mediana."""
+    picks = mne.pick_channels(raw.ch_names, include=EEG_CHANNELS)
+    if len(picks) == 0:
+        return []
+
+    data = raw.get_data(picks=picks)
     rms = np.sqrt(np.mean(data**2, axis=1))
     med = np.median(rms)
-    bad = np.where(rms > thresh_factor * med)[0]
-    return [raw.ch_names[i] for i in bad]
+    bad_idx = np.where(rms > thresh_factor * med)[0]
+
+    return [raw.ch_names[picks[i]] for i in bad_idx]
 
 
+# -------------------------------------------------------------------------
+# 2) CARGAR CANALES MALOS MANUALES (OPCIONAL)
+# -------------------------------------------------------------------------
 def load_bad_manual():
     if not BAD_CSV.exists():
         return {}
+
     df = pd.read_csv(BAD_CSV)
     d = {}
     for _, r in df.iterrows():
-        if isinstance(r["bad_channels"], str) and r["bad_channels"]:
-            d[r["subject"]] = r["bad_channels"].split(";")
+        if isinstance(r["bad_channels"], str) and r["bad_channels"].strip():
+            d[r["subject"]] = [ch.strip() for ch in r["bad_channels"].split(";")]
         else:
             d[r["subject"]] = []
     return d
 
 
+# -------------------------------------------------------------------------
+# 3) PIPELINE PRINCIPAL
+# -------------------------------------------------------------------------
 def step2_clean_and_concat(subjects=range(1, 10)):
     bad_manual = load_bad_manual()
 
@@ -63,44 +103,58 @@ def step2_clean_and_concat(subjects=range(1, 10)):
         print(f"\n===== {subj} =====")
 
         raws = []
-        auto_bad = []
+        auto_bad_all = []
 
+        # ------------------ PROCESAR BLOQUES ------------------
         for fif in fif_files:
             print(f"  Loading {fif.name}")
-            raw = mne.io.read_raw_fif(fif, preload=True)
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose='warning')
 
-            # Plot PSD manual para inspección (comentado si no quieres pausa):
-            # raw.plot_psd()
-
-            # AUTO RMS:
+            # AUTO RMS (solo EEG)
             bad_rms = detect_bad_by_rms(raw)
-            auto_bad.extend(bad_rms)
+            auto_bad_all.extend(bad_rms)
 
             raws.append(raw)
 
-        # Unir todos bloques EEG
+        # ------------------ CONCATENAR ------------------
+        print("  → Concatenating blocks...")
         raw = mne.concatenate_raws(raws)
 
-        # Unificar lista canales malos
-        bad_list = list(set(auto_bad + bad_manual.get(subj, [])))
-        bad_list = [b for b in bad_list if b in raw.ch_names]
+        # ------------------ APLICAR MALOS ------------------
+        final_bad = list(set(auto_bad_all + bad_manual.get(subj, [])))
+        final_bad = [b for b in final_bad if b in raw.ch_names]
 
-        if bad_list:
-            print("  → Marking bad channels:", bad_list)
-            raw.info["bads"] = bad_list
-            raw.interpolate_bads()
+        if final_bad:
+            print("  → Marking bad channels:", final_bad)
+            raw.info["bads"] = final_bad
 
-        # Filtro 0.5–45 Hz
-        print("  → Filtering 0.5–45 Butterworth 4th (zero-phase)")
+            # Solo interpolo si hay suficientes EEG buenos
+            eeg_picks = mne.pick_channels(raw.ch_names, include=EEG_CHANNELS)
+            good_eeg = [raw.ch_names[i] for i in eeg_picks if raw.ch_names[i] not in final_bad]
+
+            if len(good_eeg) < 4:
+                print("  ⚠ Menos de 4 EEG buenos → NO interpolamos (evita SVD error)")
+            else:
+                try:
+                    raw.interpolate_bads(reset_bads=False)
+                except Exception as e:
+                    print("  ⚠ Error en interpolate_bads, continuamos sin interpolar:", repr(e))
+
+        else:
+            print("  → Ningún canal EEG marcado como malo.")
+
+        # ------------------ FILTRO 0.5–45 Hz ------------------
+        print("  → Filtering 0.5–45 Hz Butterworth 4th order (zero-phase)")
         raw.filter(
             l_freq=0.5,
             h_freq=45,
             method="iir",
             iir_params=dict(order=4, ftype="butter"),
             phase="zero",
-            verbose="error",
+            verbose="error"
         )
 
+        # ------------------ GUARDAR ------------------
         out_sub = OUT_DIR / subj
         out_sub.mkdir(exist_ok=True)
         out_path = out_sub / "eeg_allblocks_05_45.fif"
@@ -108,5 +162,7 @@ def step2_clean_and_concat(subjects=range(1, 10)):
         print("  ✔ Saved:", out_path)
 
 
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     step2_clean_and_concat()
+
