@@ -1,30 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Dec  4 11:03:35 2025
+Created on Thu Dec  4 14:44:16 2025
 
 @author: navar
 """
 
 # -*- coding: utf-8 -*-
 """
-EEG - Paso 2 (2B + 2C):
+EEG – Paso 2 CORREGIDO (2B + 2C)
 
-  2B_build_bad_list:
-    - Lee canales malos manuales desde bad_eeg_channels_from_psd_clicks.csv
-      (salida del paso 2A PSD-click).
-    - Detecta canales malos automáticos por RMS (solo EEG).
-    - Combina manual + auto → lista final por sujeto.
-
-  2C_clean_concat_filter:
-    - Carga eeg_step1_antialias/sub-XXX/*_aa.fif
-    - Concatenar todos los bloques EEG (median + tibial, etc.)
-    - Marca info["bads"] con la lista final.
-    - Interpola canales malos (solo si hay suficientes EEG buenos).
-    - Filtro Butterworth 0.5–45 Hz (zero-phase).
-    - Guarda:
-        eeg_step2_clean_concat_05_45/sub-XXX/eeg_allblocks_05_45.fif
-    - Guarda CSV con la lista final de canales malos:
-        bad_eeg_channels_final.csv
+Objetivo:
+  ✔ Conservar TODOS los canales (EEG + ECG + EMG + misc)
+  ✔ Detectar canales EEG malos (manual PSD + auto RMS)
+  ✔ Interpolar SOLO esos EEG malos
+  ✔ Filtrar 0.5–45 Hz SIN borrar canales no EEG
+  ✔ Guardar eeg_allblocks_05_45.fif con TODOS los canales originales
 """
 
 from pathlib import Path
@@ -32,25 +22,17 @@ import numpy as np
 import mne
 import pandas as pd
 
-# -------------------------------------------------------------------------
-# DIRECTORIOS
-# -------------------------------------------------------------------------
 BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 IN_DIR  = BASE / "eeg_step1_antialias"
 OUT_DIR = BASE / "eeg_step2_clean_concat_05_45"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# CSV de malos manuales desde el paso 2A (PSD-click)
 BAD_PSD_CSV = BASE / "bad_eeg_channels_from_psd_clicks.csv"
-
-# CSV de malos finales (salida de este script)
 BAD_FINAL_CSV = BASE / "bad_eeg_channels_final.csv"
 
-# -------------------------------------------------------------------------
-# CANALES EEG (64 reales)
-# -------------------------------------------------------------------------
+# === Tus 64 EEG reales ===
 EEG_CHANNELS = [
-    "Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
+    "Fp1","Fp2","Fp2","F3","F4","C3","C4","P3","P4","O1","O2",
     "F7","F8","T7","T8","P7","P8","AFz","Fz","Cz","Pz",
     "FC1","FC2","CP1","CP2","FC5","FC6","CP5","CP6",
     "FT9","FT10","FCz","F1","F2","C1","C2","P1","P2",
@@ -60,78 +42,54 @@ EEG_CHANNELS = [
 ]
 
 
-# -------------------------------------------------------------------------
-# 2B - Cargar malos manuales desde el CSV del paso 2A (PSD-click)
-# -------------------------------------------------------------------------
+# === Cargar malos manuales del PSD ===
 def load_bad_from_psd():
-    """
-    Lee bad_eeg_channels_from_psd_clicks.csv
-    y devuelve dict[subject] -> lista de canales malos (union de todos los runs).
-    """
     if not BAD_PSD_CSV.exists():
-        print(f"⚠ No existe {BAD_PSD_CSV.name} → no se usarán malos manuales (PSD).")
+        print("⚠ No PSD CSV → sin malos manuales.")
         return {}
 
     df = pd.read_csv(BAD_PSD_CSV)
-    bad_dict = {}
 
-    # Esperado: columnas ["subject", "run", "bad_channels"]
-    for _, row in df.iterrows():
-        subj = row["subject"]
-        if isinstance(row["bad_channels"], str) and row["bad_channels"].strip():
-            chans = [ch.strip() for ch in row["bad_channels"].split(";")]
+    bad_dict = {}
+    for _, r in df.iterrows():
+        subj = r["subject"]
+        if isinstance(r["bad_channels"], str) and r["bad_channels"].strip():
+            chans = [c.strip() for c in r["bad_channels"].split(";")]
         else:
             chans = []
-        if subj not in bad_dict:
-            bad_dict[subj] = set()
-        bad_dict[subj].update(chans)
 
-    # convertimos sets a listas
-    for subj in bad_dict:
-        bad_dict[subj] = sorted(list(bad_dict[subj]))
+        bad_dict.setdefault(subj, set()).update(chans)
 
-    print(f"✓ Cargados malos manuales desde {BAD_PSD_CSV.name}")
-    return bad_dict
+    return {k: sorted(list(v)) for k, v in bad_dict.items()}
 
 
-# -------------------------------------------------------------------------
-# 2B - Detección automática RMS (solo EEG)
-# -------------------------------------------------------------------------
-def detect_bad_by_rms(raw, thresh_factor=5.0):
-    """
-    RMS por canal EEG; marca canales con RMS > thresh_factor × mediana.
-    Devuelve lista de nombres de canales malos.
-    """
+# === Detección RMS automática (solo EEG, pero sin borrar nada) ===
+def detect_bad_by_rms(raw, factor=5.0):
     picks = mne.pick_channels(raw.ch_names, include=EEG_CHANNELS)
     if len(picks) == 0:
         return []
 
     data = raw.get_data(picks=picks)
-    rms = np.sqrt(np.mean(data**2, axis=1))
-    med = np.median(rms)
-    bad_idx = np.where(rms > thresh_factor * med)[0]
+    rms = np.sqrt(np.mean(data ** 2, axis=1))
+    median = np.median(rms)
+    bad_idx = np.where(rms > factor * median)[0]
 
     return [raw.ch_names[picks[i]] for i in bad_idx]
 
 
-# -------------------------------------------------------------------------
-# 2B+2C - Pipeline principal
-# -------------------------------------------------------------------------
-def step2_clean_and_concat(subjects=range(1, 10), rms_thresh_factor=5.0):
-    """
-    Hace 2B (build bad list) + 2C (clean, concat, filter) para cada sujeto.
-    """
+# === Pipeline 2B + 2C ===
+def step2_clean_and_concat(subjects=range(1, 10)):
+
     bad_psd_dict = load_bad_from_psd()
-    final_bad_rows = []  # para escribir BAD_FINAL_CSV
+    final_bad_rows = []
 
     for s in subjects:
         subj = f"sub-{s:03d}"
         subj_dir = IN_DIR / subj
-        if not subj_dir.exists():
-            continue
-
         fif_files = sorted(subj_dir.glob("*_aa.fif"))
+
         if not fif_files:
+            print(f"{subj}: No AA files, skipping.")
             continue
 
         print(f"\n===== {subj} =====")
@@ -139,100 +97,84 @@ def step2_clean_and_concat(subjects=range(1, 10), rms_thresh_factor=5.0):
         raws = []
         auto_bad_all = []
 
-        # --------------- 2B: auto RMS por bloque ---------------
+        # === Cargar cada bloque SIN eliminar canales ===
         for fif in fif_files:
             print(f"  Loading {fif.name}")
-            raw_block = mne.io.read_raw_fif(fif, preload=False, verbose="warning")
-            eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw_block.ch_names]
-            raw_block.pick(eeg_ch)
-            raw_block.load_data()
+            raw_block = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
 
-            # AUTO RMS (solo EEG)
-            bad_rms = detect_bad_by_rms(raw_block, rms_thresh_factor)
-            if bad_rms:
-                print(f"   → Auto RMS bad ({fif.name}): {bad_rms}")
-            auto_bad_all.extend(bad_rms)
+            # RMS solo en EEG – pero NO hacemos pick()
+            eeg_ch = [ch for ch in EEG_CHANNELS if ch in raw_block.ch_names]
+            picks_eeg = mne.pick_channels(raw_block.ch_names, eeg_ch)
+
+            if len(picks_eeg) > 0:
+                bad_rms = detect_bad_by_rms(raw_block)
+                if bad_rms:
+                    print(f"   → Auto RMS bad in {fif.name}: {bad_rms}")
+                auto_bad_all.extend(bad_rms)
 
             raws.append(raw_block)
 
-        if not raws:
-            print("  ⚠ No se han cargado bloques, salto sujeto.")
-            continue
-
-        # --------------- 2C: concatenar bloques ---------------
+        # === Concatenar TODOS los canales ===
         print("  → Concatenating blocks...")
         raw = mne.concatenate_raws(raws)
 
-        # --------------- 2B: combinar manual+auto por sujeto ---------------
+        # === Combinar manual + auto ===
         manual_bad = bad_psd_dict.get(subj, [])
-        if manual_bad:
-            print(f"  → Manual bad (PSD) para {subj}: {manual_bad}")
-
         auto_bad = list(set(auto_bad_all))
-        if auto_bad:
-            print(f"  → Auto bad (RMS) para {subj}: {auto_bad}")
-
         combined_bad = sorted(list(set(manual_bad + auto_bad)))
-        # asegurarse de que existen en este raw
-        combined_bad = [ch for ch in combined_bad if ch in raw.ch_names]
+
+        # Garantizar que existen
+        combined_bad = [c for c in combined_bad if c in raw.ch_names]
 
         if combined_bad:
-            print(f"  → Final bad channels for {subj}: {combined_bad}")
+            print(f"  → Final bad EEG for {subj}: {combined_bad}")
             raw.info["bads"] = combined_bad
         else:
-            print("  → Ningún canal marcado como malo para este sujeto.")
+            print("  → No EEG bads for this subject.")
 
-        # guardar en lista para CSV final
-        final_bad_rows.append({
-            "subject": subj,
-            "bad_channels": ";".join(combined_bad) if combined_bad else ""
-        })
-
-        # --------------- 2C: interpolación segura ---------------
+        # === Interpolación SOLO si hay suficientes EEG buenos ===
         if combined_bad:
-            eeg_picks = mne.pick_channels(raw.ch_names, include=EEG_CHANNELS)
-            good_eeg = [
-                raw.ch_names[i] for i in eeg_picks
-                if raw.ch_names[i] not in combined_bad
-            ]
+            all_eeg = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
+            good = [ch for ch in all_eeg if ch not in combined_bad]
 
-            if len(good_eeg) < 4:
-                print("  ⚠ Menos de 4 EEG buenos → NO interpolamos (evita SVD error).")
+            if len(good) < 4:
+                print("  ⚠ Too few EEG good channels → skip interpolation.")
             else:
-                try:
-                    print("  → Interpolando canales malos...")
-                    raw.interpolate_bads(reset_bads=False)
-                except Exception as e:
-                    print("  ⚠ Error en interpolate_bads, continúo sin interpolar:", repr(e))
+                print("  → Interpolating EEG bad channels...")
+                raw.interpolate_bads()
 
-        # --------------- 2C: filtro 0.5–45 Hz ---------------
-        print("  → Filtering 0.5–45 Hz Butterworth 4th order (zero-phase)...")
+        # === Filtrado global (TODOS los canales) ===
+        print("  → Filtering 0.5–45 Hz...")
         raw.filter(
             l_freq=0.5,
-            h_freq=45.0,
+            h_freq=45,
             method="iir",
             iir_params=dict(order=4, ftype="butter"),
             phase="zero",
+            picks="all",
             verbose="error",
         )
 
-        # --------------- 2C: guardar fif ---------------
+        # === Guardar ===
         out_sub = OUT_DIR / subj
-        out_sub.mkdir(exist_ok=True, parents=True)
+        out_sub.mkdir(exist_ok=True)
         out_path = out_sub / "eeg_allblocks_05_45.fif"
         raw.save(out_path, overwrite=True)
-        print("  ✔ Saved cleaned+concat EEG:", out_path)
+        print("  ✔ Saved:", out_path)
 
-    # --------------- guardar CSV de malos finales ---------------
+        # === Registrar malos finales ===
+        final_bad_rows.append({
+            "subject": subj,
+            "bad_channels": ";".join(combined_bad)
+        })
+
+    # CSV final
     if final_bad_rows:
-        df_bad = pd.DataFrame(final_bad_rows)
-        df_bad.to_csv(BAD_FINAL_CSV, index=False)
-        print(f"\n✔ Guardado CSV de malos finales: {BAD_FINAL_CSV}")
-    else:
-        print("\n⚠ No se generó lista de malos finales (ningún sujeto procesado).")
+        pd.DataFrame(final_bad_rows).to_csv(BAD_FINAL_CSV, index=False)
+        print(f"\n✔ Final bad channels CSV saved → {BAD_FINAL_CSV}")
 
 
-# -------------------------------------------------------------------------
+# Ejecutar
 if __name__ == "__main__":
     step2_clean_and_concat()
 
