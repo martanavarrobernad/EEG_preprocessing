@@ -1,0 +1,402 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec 15 13:38:17 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+STEP 3B — Selección de ICs con correlaciones EOG/ECG (tipo SASICA) — FIXED
+------------------------------------------------------------------------
+Arreglos clave:
+  - Encuentra el archivo ICA aunque no se llame exactamente "ica_fitted.fif".
+  - Alinea sfreq/longitud antes de correlacionar (raw resampleado a sfreq del ICA).
+  - HEOG = F7 - F8 (no media).
+  - corr_thresh se usa de verdad (umbral absoluto adicional).
+  - Fuentes ICA se calculan sobre raw_eeg (exactamente ica.ch_names).
+"""
+
+from pathlib import Path
+from math import ceil
+
+import mne
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ================================================================
+# CONFIGURACIÓN GENERAL
+# ================================================================
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+IN_DATA = BASE / "eeg_step2_clean_concat_05_45"
+IN_ICA  = BASE / "eeg_step3_ica"
+OUT_CSV = BASE / "bad_ica_components.csv"
+
+# Nombres de canales (ajusta si hace falta)
+ECG_CH_NAME = "ECG"
+VEOG_CHS    = ("Fp1", "Fp2")   # proxy vertical (promedio)
+HEOG_CHS    = ("F7", "F8")     # proxy horizontal (diferencia)
+
+DEFAULT_CORR_THRESH = 0.30
+
+# Umbrales tipo SASICA (por SD)
+N_SD_ECG = 1.0
+N_SD_EOG = 4.0
+
+
+# ================================================================
+# UTILIDADES
+# ================================================================
+def _safe_corr(x, y) -> float:
+    """Pearson r robusto: devuelve 0 si hay problemas numéricos."""
+    x = np.asarray(x, float).ravel()
+    y = np.asarray(y, float).ravel()
+    if x.size == 0 or y.size == 0 or x.size != y.size:
+        return 0.0
+    if np.std(x) == 0 or np.std(y) == 0:
+        return 0.0
+    r = np.corrcoef(x, y)[0, 1]
+    if np.isnan(r):
+        return 0.0
+    return float(r)
+
+
+def _find_ica_file(subj_dir: Path) -> Path | None:
+    """
+    Encuentra un archivo ICA en la carpeta del sujeto.
+    Prioriza nombres típicos: ica_fitted*.fif
+    """
+    candidates = sorted(subj_dir.glob("ica_fitted*.fif"))
+    if not candidates:
+        candidates = sorted(subj_dir.glob("*.fif"))
+        candidates = [p for p in candidates if "ica" in p.name.lower()]
+    return candidates[0] if candidates else None
+
+
+def load_raw_and_ica(subj: str):
+    """Carga raw continuo y la ICA entrenada (auto-detect)."""
+    fif_path = IN_DATA / subj / "eeg_allblocks_05_45.fif"
+    if not fif_path.exists():
+        print(f" ⚠ No EEG data for {subj}: {fif_path}")
+        return None, None
+
+    subj_ica_dir = IN_ICA / subj
+    ica_path = _find_ica_file(subj_ica_dir)
+
+    if ica_path is None or not ica_path.exists():
+        print(f" ⚠ No ICA found for {subj} in: {subj_ica_dir}")
+        return None, None
+
+    print(f" → Loading raw: {fif_path.name}")
+    raw = mne.io.read_raw_fif(fif_path, preload=True, verbose="warning")
+
+    print(f" → Loading ICA: {ica_path.name}")
+    ica = mne.preprocessing.read_ica(ica_path, verbose="warning")
+
+    return raw, ica
+
+
+def make_raw_eeg_from_ica(raw, ica):
+    """
+    Devuelve raw_eeg con EXACTAMENTE los canales que usó ICA (mismo orden).
+    Además asigna montage easycap-M1 para topomaps.
+    """
+    ica_chs = list(ica.ch_names)
+
+    missing = [ch for ch in ica_chs if ch not in raw.ch_names]
+    if missing:
+        raise RuntimeError(f"Canales de ICA no presentes en raw: {missing}")
+
+    raw_eeg = raw.copy().pick(ica_chs)  # mismo orden que ICA
+
+    montage = mne.channels.make_standard_montage("easycap-M1")
+    raw_eeg.set_montage(montage, on_missing="ignore")
+
+    return raw_eeg
+
+
+def _get_signal(raw, ch):
+    """Devuelve señal 1D de un canal si existe, si no None."""
+    if ch not in raw.ch_names:
+        return None
+    return raw.get_data(picks=[ch])[0]
+
+
+def build_reference_signals(raw_full, target_sfreq: float):
+    """
+    Construye señales de referencia ECG/VEOG/HEOG desde raw_full,
+    y las alinea al sfreq objetivo (resample si hace falta).
+    """
+    raw_ref = raw_full.copy()
+
+    # Pick solo canales necesarios si existen (más rápido y menos RAM en resample)
+    picks = []
+    for ch in (ECG_CH_NAME, *VEOG_CHS, *HEOG_CHS):
+        if ch in raw_ref.ch_names:
+            picks.append(ch)
+    if picks:
+        raw_ref.pick(picks)
+
+    # Resamplear referencias al sfreq del ICA para alinear longitudes
+    if abs(raw_ref.info["sfreq"] - target_sfreq) > 1e-6:
+        raw_ref.resample(target_sfreq, npad="auto")
+
+    # ECG
+    ecg = _get_signal(raw_ref, ECG_CH_NAME)
+
+    # VEOG proxy: media Fp1/Fp2 disponibles
+    fp1 = _get_signal(raw_ref, VEOG_CHS[0])
+    fp2 = _get_signal(raw_ref, VEOG_CHS[1])
+    veog = None
+    if fp1 is not None and fp2 is not None:
+        veog = 0.5 * (fp1 + fp2)
+    elif fp1 is not None:
+        veog = fp1
+    elif fp2 is not None:
+        veog = fp2
+
+    # HEOG proxy: diferencia F7-F8 (clave)
+    f7 = _get_signal(raw_ref, HEOG_CHS[0])
+    f8 = _get_signal(raw_ref, HEOG_CHS[1])
+    heog = None
+    if f7 is not None and f8 is not None:
+        heog = f7 - f8
+    # si falta uno de los dos, no inventamos: mejor None (evitas falsos negativos/positivos)
+
+    return ecg, veog, heog
+
+
+def suggest_bad_ics_by_corr(raw_full, raw_eeg, ica,
+                            corr_thresh=DEFAULT_CORR_THRESH,
+                            n_sd_ecg=N_SD_ECG,
+                            n_sd_eog=N_SD_EOG):
+    """
+    Correlaciona cada IC con ECG/VEOG/HEOG (referencias alineadas)
+    y sugiere ICs por:
+      A) Umbral tipo SASICA: |corr| > mean + n_sd*sd
+      B) Umbral absoluto extra: |corr| >= corr_thresh
+    """
+    print("\n → Computing IC correlations with ECG / VEOG / HEOG (aligned)...")
+
+    # Si ICA se entrenó a otra sfreq, alineamos raw_eeg a esa sfreq
+    # (en MNE, ica suele llevar ica.info['sfreq'])
+    sfreq_ica = None
+    if hasattr(ica, "info") and isinstance(ica.info, dict):
+        sfreq_ica = ica.info.get("sfreq", None)
+    if sfreq_ica is None:
+        sfreq_ica = raw_eeg.info["sfreq"]
+
+    raw_eeg_aligned = raw_eeg
+    if abs(raw_eeg_aligned.info["sfreq"] - sfreq_ica) > 1e-6:
+        raw_eeg_aligned = raw_eeg_aligned.copy().resample(sfreq_ica, npad="auto")
+
+    # Referencias ECG/EOG alineadas a sfreq_ica
+    ecg_sig, veog_sig, heog_sig = build_reference_signals(raw_full, target_sfreq=sfreq_ica)
+
+    # Fuentes ICA sobre EEG-alineado: (n_ic, n_samples)
+    src = ica.get_sources(raw_eeg_aligned).get_data()
+    n_ic, n_samp = src.shape
+
+    # Asegurar longitudes iguales (por seguridad)
+    def _clip(sig):
+        if sig is None:
+            return None
+        sig = np.asarray(sig).ravel()
+        if sig.size > n_samp:
+            return sig[:n_samp]
+        if sig.size < n_samp:
+            return None  # mejor None que correlación desalineada
+        return sig
+
+    ecg_sig  = _clip(ecg_sig)
+    veog_sig = _clip(veog_sig)
+    heog_sig = _clip(heog_sig)
+
+    corr_ecg  = np.zeros(n_ic)
+    corr_veog = np.zeros(n_ic)
+    corr_heog = np.zeros(n_ic)
+
+    for i in range(n_ic):
+        if ecg_sig is not None:
+            corr_ecg[i]  = _safe_corr(src[i], ecg_sig)
+        if veog_sig is not None:
+            corr_veog[i] = _safe_corr(src[i], veog_sig)
+        if heog_sig is not None:
+            corr_heog[i] = _safe_corr(src[i], heog_sig)
+
+    def _auto_bad(corr_vec, n_sd):
+        a = np.abs(corr_vec)
+        m = a.mean()
+        s = a.std()
+        if s == 0:
+            return np.array([], dtype=int), m, s, np.inf
+        thr = m + n_sd * s
+        idx = np.where(a > thr)[0]
+        return idx, m, s, thr
+
+    bad_ecg_sd,  m_ecg,  s_ecg,  thr_ecg  = _auto_bad(corr_ecg,  n_sd_ecg)
+    bad_veog_sd, m_v,    s_v,    thr_v    = _auto_bad(corr_veog, n_sd_eog)
+    bad_heog_sd, m_h,    s_h,    thr_h    = _auto_bad(corr_heog, n_sd_eog)
+
+    # Umbral absoluto adicional
+    bad_ecg_abs  = np.where(np.abs(corr_ecg)  >= corr_thresh)[0]
+    bad_veog_abs = np.where(np.abs(corr_veog) >= corr_thresh)[0]
+    bad_heog_abs = np.where(np.abs(corr_heog) >= corr_thresh)[0]
+
+    # Uniones finales por tipo
+    bad_ecg  = np.unique(np.concatenate([bad_ecg_sd,  bad_ecg_abs])).astype(int)
+    bad_veog = np.unique(np.concatenate([bad_veog_sd, bad_veog_abs])).astype(int)
+    bad_heog = np.unique(np.concatenate([bad_heog_sd, bad_heog_abs])).astype(int)
+
+    print("\n=== IC correlations ===")
+    print("IC\tcorr_ECG\tcorr_VEOG\tcorr_HEOG")
+    for i in range(n_ic):
+        print(f"{i:02d}\t{corr_ecg[i]: .3f}\t\t{corr_veog[i]: .3f}\t\t{corr_heog[i]: .3f}")
+
+    print("\n=== Thresholds ===")
+    print(f"  corr_thresh abs = {corr_thresh:.2f}")
+    print(f"  ECG  SD-thr: mean={m_ecg:.3f} sd={s_ecg:.3f} -> thr={thr_ecg:.3f}")
+    print(f"  VEOG SD-thr: mean={m_v:.3f}   sd={s_v:.3f}   -> thr={thr_v:.3f}")
+    print(f"  HEOG SD-thr: mean={m_h:.3f}   sd={s_h:.3f}   -> thr={thr_h:.3f}")
+
+    print("\n=== Suggested ICs ===")
+    print(f"  Cardiaco (ECG):  {bad_ecg.tolist()}")
+    print(f"  Ocular (VEOG):   {bad_veog.tolist()}")
+    print(f"  Ocular (HEOG):   {bad_heog.tolist()}")
+
+    return bad_ecg, bad_veog, bad_heog
+
+
+def plot_ic_topomaps(ica, raw_eeg):
+    """Topoplots de TODOS los ICs."""
+    components = ica.get_components()  # (n_ch_ica, n_ic)
+    n_ch, n_ic = components.shape
+
+    n_cols = 5
+    n_rows = ceil(n_ic / n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 3.0 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+
+    print(" → Plotting IC topographies (easycap-M1)...")
+
+    for ic_idx in range(n_ic):
+        ax = axes[ic_idx]
+        topo = components[:, ic_idx]
+        mne.viz.plot_topomap(
+            data=topo,
+            pos=raw_eeg.info,
+            ch_type="eeg",
+            sensors=True,
+            contours=0,
+            cmap="RdBu_r",
+            outlines="head",
+            axes=ax,
+            show=False,
+        )
+        ax.set_title(f"IC {ic_idx}", fontsize=8)
+
+    for ax in axes[n_ic:]:
+        ax.axis("off")
+
+    fig.suptitle("ICA topographies (easycap-M1)", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def make_raw_view_for_traces(raw_eeg, win_len=20.0, target_sfreq=200.0):
+    """Ventana corta centrada + resample para ver trazas."""
+    duration = raw_eeg.times[-1]
+    if duration <= win_len:
+        raw_view = raw_eeg.copy()
+    else:
+        mid = duration / 2.0
+        tmin = max(0.0, mid - win_len / 2.0)
+        tmax = min(duration, mid + win_len / 2.0)
+        raw_view = raw_eeg.copy().crop(tmin=tmin, tmax=tmax)
+
+    if raw_view.info["sfreq"] > target_sfreq + 1e-6:
+        print(f" → Resampling EEG view from {raw_view.info['sfreq']:.1f} Hz to {target_sfreq:.1f} Hz")
+        raw_view.resample(target_sfreq, npad="auto")
+
+    return raw_view
+
+
+def plot_ic_traces(ica, raw_view):
+    """Trazas de ICs (ventana corta)."""
+    print(" → Plotting IC time series (short window)...")
+    plt.ioff()
+    fig = ica.plot_sources(raw_view, show_scrollbars=True)
+    plt.show(block=True)
+    plt.close(fig)
+
+
+# ================================================================
+# PIPELINE PRINCIPAL
+# ================================================================
+def step3b_mark_bad_ics(subjects=range(1, 5),
+                        corr_thresh=DEFAULT_CORR_THRESH):
+    rows = []
+
+    for s in subjects:
+        subj = f"sub-{s:03d}"
+        print(f"\n========== {subj} — STEP 3B (IC selection with corr) ==========")
+
+        raw, ica = load_raw_and_ica(subj)
+        if raw is None or ica is None:
+            continue
+
+        # Construir raw_eeg exactamente como lo vio ICA (y con montage)
+        raw_eeg = make_raw_eeg_from_ica(raw, ica)
+
+        # 1) Sugerencias por correlación (ya alineado y HEOG bien)
+        bad_ecg, bad_veog, bad_heog = suggest_bad_ics_by_corr(
+            raw_full=raw,
+            raw_eeg=raw_eeg,
+            ica=ica,
+            corr_thresh=corr_thresh,
+            n_sd_ecg=N_SD_ECG,
+            n_sd_eog=N_SD_EOG,
+        )
+
+        # 2) Topoplots
+        plot_ic_topomaps(ica, raw_eeg)
+
+        # 3) Trazas en ventana corta
+        raw_view = make_raw_view_for_traces(raw_eeg, win_len=20.0, target_sfreq=200.0)
+        plot_ic_traces(ica, raw_view)
+
+        # 4) Selección manual (con sugerencia)
+        suggested_union = sorted(set(bad_ecg) | set(bad_veog) | set(bad_heog))
+
+        print("\nIntroduce los índices de ICs que quieres marcar como MALOS.")
+        print(f"Sugeridos (union): {suggested_union}")
+        print("Ejemplo: 0, 1, 7   | ENTER = aceptar sugeridos")
+        txt = input(f"ICs malos para {subj}: ").strip()
+
+        if txt:
+            manual = {int(t.strip()) for t in txt.split(",") if t.strip() != ""}
+            bad_ics = sorted(manual)
+        else:
+            bad_ics = suggested_union
+
+        print(f" → ICs finales marcados como malos para {subj}: {bad_ics}")
+
+        rows.append({
+            "subject": subj,
+            "bad_ics": ";".join(str(ic) for ic in bad_ics)
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(OUT_CSV, index=False)
+        print(f"\n✔ Saved bad ICs to: {OUT_CSV}")
+    else:
+        print("\n⚠ No bad ICs saved.")
+
+
+if __name__ == "__main__":
+    step3b_mark_bad_ics(subjects=range(1, 5), corr_thresh=0.30)
